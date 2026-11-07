@@ -1,0 +1,256 @@
+name: Build vein_tree mod
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - .github/workflows/build.yml
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - name: Cache the mod tool
+        id: tool
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-horizon-mod
+          key: cargo-horizon-mod-ee94c02c
+      - name: Install the mod tool
+        if: steps.tool.outputs.cache-hit != 'true'
+        run: cargo install --locked --git https://github.com/JAK-cool162/horizon-android --rev ee94c02ccb7f56914f6aa9a1f1ec7c4bc7b75694 cargo-horizon-mod
+      - name: Write the mod project
+        run: |
+          mkdir -p mod/src
+          cat > mod/horizon-mod.toml <<'MODEOF'
+          id = "vein_tree"
+          name = "Vein Miner and Tree Capitator"
+          version = "0.1.0"
+          description = "Break one ore and the whole connected vein goes with it. Break a tree log and the whole tree falls. Toggle with /veinminer and /treecap."
+          authors = ["me"]
+          api = "0.3"
+          side = "server"
+          capabilities = ["players", "world"]
+          MODEOF
+          cat > mod/Cargo.toml <<'MODEOF'
+          [package]
+          name = "vein-tree"
+          version = "0.1.0"
+          edition = "2021"
+          publish = false
+
+          [lib]
+          crate-type = ["cdylib"]
+
+          [dependencies]
+          horizon-mod-sdk = { git = "https://github.com/JAK-cool162/horizon-android", rev = "ee94c02ccb7f56914f6aa9a1f1ec7c4bc7b75694" }
+
+          [profile.release]
+          opt-level = "s"
+          lto = true
+          MODEOF
+          cat > mod/src/lib.rs <<'MODEOF'
+          //! Vein Miner and Tree Capitator: a Horizon Android server mod (API 0.3).
+          //! Break one ore: the connected vein breaks too. Break a log of a natural tree
+          //! (one with leaves): the connected logs above break too.
+          //! Commands: /veinminer and /treecap toggle each feature for the player who types them.
+          use horizon_mod_sdk::server::{world, Args, BlockPos, Player, Registration, ServerMod};
+          use std::collections::{HashMap, HashSet, VecDeque};
+
+          type Pos = (i32, i32, i32);
+
+          const MAX_VEIN: usize = 64;
+          const MAX_TREE: usize = 128;
+          /// Ticks during which blocks this mod broke are ignored if the game reports them again.
+          const IGNORE_TICKS: u64 = 5;
+
+          #[derive(Clone, Copy, PartialEq)]
+          enum Kind {
+              Ore,
+              Log,
+          }
+
+          struct VeinTree {
+              tick: u64,
+              vein_off: HashSet<String>,
+              tree_off: HashSet<String>,
+              ours: HashMap<Pos, u64>,
+          }
+
+          // The only two places that touch the world API. If the build complains about the
+          // SDK's signatures, only these two functions need to change.
+          fn block_at(dim: &str, p: Pos) -> Option<String> {
+              world::get_block(dim, p.0, p.1, p.2)
+          }
+
+          fn break_all(dim: &str, ps: &[Pos]) -> Result<(), String> {
+              world::break_blocks(dim, ps, true)
+          }
+
+          /// `minecraft:oak_log[axis=y]` -> `minecraft:oak_log`
+          fn base_id(state: &str) -> &str {
+              state.split('[').next().unwrap_or(state)
+          }
+
+          /// What kind of block this is and which family it belongs to (so that stone and
+          /// deepslate versions of an ore count as the same vein).
+          fn kind_and_family(id: &str) -> Option<(Kind, String)> {
+              let short = id.strip_prefix("minecraft:").unwrap_or(id);
+              if short.ends_with("_ore") || short == "ancient_debris" {
+                  let family = short.strip_prefix("deepslate_").unwrap_or(short);
+                  return Some((Kind::Ore, family.to_string()));
+              }
+              if short.ends_with("_log") || short == "crimson_stem" || short == "warped_stem" {
+                  return Some((Kind::Log, short.to_string()));
+              }
+              None
+          }
+
+          fn is_leaves(id: &str) -> bool {
+              let short = id.strip_prefix("minecraft:").unwrap_or(id);
+              short.ends_with("_leaves") || short.ends_with("_wart_block") || short == "shroomlight"
+          }
+
+          /// Flood-fills from `origin` (the block the player just broke) over blocks of the same
+          /// family. Trees only count if leaves were seen next to the logs, so a log cabin is safe.
+          fn collect(dim: &str, origin: Pos, kind: Kind, family: &str) -> Vec<Pos> {
+              let max = match kind {
+                  Kind::Ore => MAX_VEIN,
+                  Kind::Log => MAX_TREE,
+              };
+              let dys: &[i32] = match kind {
+                  Kind::Ore => &[-1, 0, 1],
+                  Kind::Log => &[0, 1],
+              };
+              let mut seen: HashSet<Pos> = HashSet::new();
+              seen.insert(origin);
+              let mut queue: VecDeque<Pos> = VecDeque::new();
+              queue.push_back(origin);
+              let mut found: Vec<Pos> = Vec::new();
+              let mut leaves = false;
+              'search: while let Some((x, y, z)) = queue.pop_front() {
+                  for dx in -1..=1 {
+                      for &dy in dys {
+                          for dz in -1..=1 {
+                              let next = (x + dx, y + dy, z + dz);
+                              if !seen.insert(next) {
+                                  continue;
+                              }
+                              let Some(state) = block_at(dim, next) else {
+                                  continue;
+                              };
+                              let id = base_id(&state);
+                              if kind == Kind::Log && is_leaves(id) {
+                                  leaves = true;
+                                  continue;
+                              }
+                              if let Some((k, f)) = kind_and_family(id) {
+                                  if k == kind && f == family {
+                                      found.push(next);
+                                      queue.push_back(next);
+                                      if found.len() >= max {
+                                          break 'search;
+                                      }
+                                  }
+                              }
+                          }
+                      }
+                  }
+              }
+              if kind == Kind::Log && !leaves {
+                  found.clear();
+              }
+              found
+          }
+
+          impl ServerMod for VeinTree {
+              fn init() -> Result<(Self, Registration), String> {
+                  let me = VeinTree {
+                      tick: 0,
+                      vein_off: HashSet::new(),
+                      tree_off: HashSet::new(),
+                      ours: HashMap::new(),
+                  };
+                  let reg = Registration::new()
+                      .on_blocks()
+                      .on_tick()
+                      .command("veinminer")
+                      .command("treecap");
+                  Ok((me, reg))
+              }
+
+              fn tick(&mut self, tick: u64) {
+                  self.tick = tick;
+                  self.ours.retain(|_, until| *until >= tick);
+              }
+
+              fn command(
+                  &mut self,
+                  p: &Player,
+                  name: &str,
+                  _args: &Args,
+              ) -> Result<Option<String>, String> {
+                  let (set, label) = match name {
+                      "veinminer" => (&mut self.vein_off, "Vein miner"),
+                      "treecap" => (&mut self.tree_off, "Tree capitator"),
+                      _ => return Err(format!("unknown command {name}")),
+                  };
+                  let now_on = set.remove(&p.id);
+                  if !now_on {
+                      set.insert(p.id.clone());
+                  }
+                  let state = if now_on { "on" } else { "off" };
+                  Ok(Some(format!("{label} {state}")))
+              }
+
+              fn block_broken(&mut self, p: &Player, pos: BlockPos, state: &str) {
+                  let origin: Pos = (pos.x, pos.y, pos.z);
+                  if self.ours.get(&origin).is_some_and(|until| *until >= self.tick) {
+                      return;
+                  }
+                  let Some((kind, family)) = kind_and_family(base_id(state)) else {
+                      return;
+                  };
+                  let off = match kind {
+                      Kind::Ore => &self.vein_off,
+                      Kind::Log => &self.tree_off,
+                  };
+                  if off.contains(&p.id) {
+                      return;
+                  }
+                  let found = collect(&p.dimension, origin, kind, &family);
+                  if found.is_empty() {
+                      return;
+                  }
+                  if break_all(&p.dimension, &found).is_ok() {
+                      let until = self.tick + IGNORE_TICKS;
+                      for q in found {
+                          self.ours.insert(q, until);
+                      }
+                  }
+              }
+          }
+
+          horizon_mod_sdk::export_server_mod!(VeinTree);
+          MODEOF
+      - name: Build the mod
+        working-directory: mod
+        run: cargo horizon-mod build
+      - name: Check the mod
+        working-directory: mod
+        run: |
+          ls target/horizon-mod
+          cargo horizon-mod check target/horizon-mod/vein_tree.hmod
+      - name: Publish the file to the repo
+        run: |
+          cp mod/target/horizon-mod/vein_tree.hmod vein_tree.hmod
+          git config user.name "github-actions"
+          git config user.email "github-actions@users.noreply.github.com"
+          git add vein_tree.hmod
+          git commit -m "Build vein_tree.hmod" || echo "nothing new to commit"
+          git push
