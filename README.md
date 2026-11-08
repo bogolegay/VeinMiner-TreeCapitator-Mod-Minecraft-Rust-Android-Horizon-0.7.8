@@ -1,3 +1,2 @@
 # bogoles
-treecap vein only work on dev version
-1000% vibe coded 
+Minecraft Android Rust Horizon 0.7.8 treecap vein 1000% vibe coded 
