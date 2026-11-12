@@ -1,0 +1,113 @@
+name: Build the reference pictures mod
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - pictures/**
+      - .github/workflows/pictures.yml
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install pillow
+      - name: Write the builder
+        run: |
+          cat > build_pictures.py <<'PYEOF'
+          """Turns the pictures in ./pictures into refpics.hmod: every picture becomes a painting you can hang on a wall."""
+          import glob, io, json, os, re, zipfile
+          from PIL import Image
+
+          NS = "refpics"
+          OUT = "refpics.hmod"
+          EXT = (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif")
+          files = sorted(f for f in glob.glob("pictures/*") if f.lower().endswith(EXT))[:99]
+          if not files:
+              raise SystemExit("No pictures found: put images in the pictures folder.")
+          resample = getattr(Image, "Resampling", Image).LANCZOS
+
+          def blocks_for(w, h):
+              """Painting size in blocks (long side 4..10) that bends the picture's proportions the least."""
+              long_, short = (w, h) if w >= h else (h, w)
+              best = None
+              for L in range(4, 11):
+                  s = L * short / long_
+                  S = max(1, round(s))
+                  err = abs(S - s) / s
+                  if best is None or err < best[0] - 1e-9:
+                      best = (err, L, S)
+              _, L, S = best
+              return (L, S) if w >= h else (S, L)
+
+          out = {}
+          def put(path, data):
+              out[path] = data if isinstance(data, bytes) else data.encode()
+
+          names, used, sizes = [], set(), []
+          for i, f in enumerate(files, 1):
+              base = re.sub(r"[^a-z0-9_]+", "_", os.path.splitext(os.path.basename(f))[0].lower()).strip("_")[:40] or f"picture_{i}"
+              name, n = base, 2
+              while name in used:
+                  name, n = f"{base}_{n}", n + 1
+              used.add(name)
+              im = Image.open(f).convert("RGBA")
+              w, h = im.size
+              k = 512 / max(w, h)
+              if k < 1:
+                  im = im.resize((max(1, round(w * k)), max(1, round(h * k))), resample)
+              bw, bh = blocks_for(*im.size)
+              buf = io.BytesIO(); im.save(buf, "PNG")
+              put(f"assets/{NS}/textures/painting/{name}.png", buf.getvalue())
+              put(f"data/{NS}/painting_variant/{name}.json", json.dumps({
+                  "asset_id": f"{NS}:{name}", "width": bw, "height": bh,
+                  "title": {"text": name}, "author": {"text": "you"}}, indent=2))
+              names.append(name); sizes.append((bw, bh))
+
+          put("horizon-mod.toml", f'''id = "{NS}"
+          name = "Reference Pictures"
+          version = "1.0.0"
+          description = "Your pictures as paintings to hang on walls while you build. /trigger rp_list set 1 lists them, /trigger rp_get set N gives picture N."
+          authors = ["me"]
+          api = "0.2"
+          side = "both"
+          capabilities = ["registries"]
+          ''')
+          put("data/minecraft/tags/function/load.json", json.dumps({"values": [f"{NS}:load"]}, indent=2))
+          put("data/minecraft/tags/function/tick.json", json.dumps({"values": [f"{NS}:tick"]}, indent=2))
+          def fn(name, lines): put(f"data/{NS}/function/{name}.mcfunction", "\n".join(lines) + "\n")
+
+          fn("load", ["scoreboard objectives add rp_tmp dummy", "scoreboard objectives add rp_get trigger",
+                      "scoreboard objectives add rp_list trigger", "scoreboard players set #t rp_tmp 0"])
+          fn("tick", ["scoreboard players add #t rp_tmp 1", f"execute if score #t rp_tmp matches 5.. run function {NS}:poll"])
+          fn("poll", ["scoreboard players set #t rp_tmp 0", "scoreboard players enable @a rp_get", "scoreboard players enable @a rp_list",
+                      f"execute as @a[scores={{rp_get=1..}}] run function {NS}:get",
+                      f"execute as @a[scores={{rp_list=1..}}] run function {NS}:list",
+                      "scoreboard players set @a[scores={rp_get=1..}] rp_get 0",
+                      "scoreboard players set @a[scores={rp_list=1..}] rp_list 0"])
+          fn("get", [f"execute unless score @s rp_get matches 1..{len(names)} run tellraw @s \"No such picture. Type /trigger rp_list set 1\""] +
+                    [f"execute if score @s rp_get matches {i} run function {NS}:give/{n}" for i, n in enumerate(names, 1)])
+          fn("list", ['tellraw @s "Pictures (use /trigger rp_get set NUMBER):"'] +
+                    [f'tellraw @s "{i}: {n} ({sizes[i-1][0]}x{sizes[i-1][1]} blocks)"' for i, n in enumerate(names, 1)])
+          for i, n in enumerate(names, 1):   # one tiny function per picture, so a problem with one cannot touch the others
+              fn(f"give/{n}", [f'give @s minecraft:painting[minecraft:painting/variant="{NS}:{n}"]',
+                               f'tellraw @s "Picture {i}: {n}. Hang it on a wall ({sizes[i-1][0]}x{sizes[i-1][1]} blocks of free space needed)."'])
+
+          with zipfile.ZipFile(OUT, "w", zipfile.ZIP_DEFLATED) as z:
+              for path in sorted(out): z.writestr(path, out[path])
+          print(f"built {OUT}: {len(names)} pictures")
+          for i, (n, s) in enumerate(zip(names, sizes), 1): print(f"  {i}: {n}  {s[0]}x{s[1]} blocks")
+          PYEOF
+      - name: Build refpics.hmod
+        run: python build_pictures.py
+      - name: Save refpics.hmod in the repo
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@users.noreply.github.com"
+          git add refpics.hmod
+          git commit -m "Build refpics.hmod" || echo "nothing new to commit"
+          git push
