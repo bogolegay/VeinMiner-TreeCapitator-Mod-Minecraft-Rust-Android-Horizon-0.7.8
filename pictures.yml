@@ -1,0 +1,123 @@
+name: Build the reference pictures mod
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - pictures/**
+      - .github/workflows/pictures.yml
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install pillow
+      - name: Write the builder
+        run: |
+          cat > build_pictures.py <<'PYEOF'
+          """Turns the pictures in ./pictures into refpics.hmod: every picture becomes an item that covers the whole screen at 1:1 when worn."""
+          import glob, io, json, os, re, zipfile
+          from PIL import Image, ImageOps
+
+          NS = "refpics"
+          OUT = "refpics.hmod"
+          EXT = (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif")
+          SCREEN = (2400, 1080)                      # your screen in pixels; change it with a pictures/screen.txt holding e.g. 2400x1080
+          if os.path.exists("pictures/screen.txt"):
+              m = re.match(r"\s*(\d+)\s*[x*,]\s*(\d+)", open("pictures/screen.txt").read())
+              if m:
+                  SCREEN = (min(4096, int(m[1])), min(4096, int(m[2])))
+          files = sorted(f for f in glob.glob("pictures/*") if f.lower().endswith(EXT))[:99]
+          if not files:
+              raise SystemExit("No pictures found: put images in the pictures folder.")
+          resample = getattr(Image, "Resampling", Image).LANCZOS
+
+          out = {}
+          def put(path, data):
+              out[path] = data if isinstance(data, bytes) else data.encode()
+          def png(im):
+              b = io.BytesIO(); im.save(b, "PNG"); return b.getvalue()
+
+          names, used = [], set()
+          for i, f in enumerate(files, 1):
+              base = re.sub(r"[^a-z0-9_]+", "_", os.path.splitext(os.path.basename(f))[0].lower()).strip("_")[:40] or f"picture_{i}"
+              name, n = base, 2
+              while name in used:
+                  name, n = f"{base}_{n}", n + 1
+              used.add(name); names.append(name)
+              im = ImageOps.exif_transpose(Image.open(f)).convert("RGBA")
+              w, h = im.size
+              k = min(SCREEN[0] / w, SCREEN[1] / h)               # fit the whole picture on the screen, keep its proportions
+              nw, nh = max(1, round(w * k)), max(1, round(h * k))
+              canvas = Image.new("RGBA", SCREEN, (0, 0, 0, 0))     # empty edges stay see-through
+              canvas.paste(im.resize((nw, nh), resample), ((SCREEN[0] - nw) // 2, (SCREEN[1] - nh) // 2))
+              put(f"assets/{NS}/textures/misc/{name}.png", png(canvas))
+              th = im.copy(); th.thumbnail((32, 32), resample)
+              icon = Image.new("RGBA", (32, 32), (0, 0, 0, 0)); icon.paste(th, ((32 - th.size[0]) // 2, (32 - th.size[1]) // 2))
+              put(f"assets/{NS}/textures/item/{name}.png", png(icon))
+              put(f"assets/{NS}/models/item/{name}.json", json.dumps({"parent": "minecraft:item/generated", "textures": {"layer0": f"{NS}:item/{name}"}}, indent=2))
+              put(f"assets/{NS}/items/{name}.json", json.dumps({"model": {"type": "minecraft:model", "model": f"{NS}:item/{name}"}}, indent=2))
+              put(f"data/{NS}/horizon/item/{name}.json", json.dumps({
+                  "template": "minecraft:paper",
+                  "max_stack_size": 1,
+                  "components": {
+                      "minecraft:item_name": {"text": f"Picture: {name}"},
+                      "minecraft:equippable": {"slot": "head", "camera_overlay": f"{NS}:misc/{name}", "swappable": True}}}, indent=2))
+          put(f"data/{NS}/horizon/creative_tab/pictures.json", json.dumps({"title": "Pictures", "icon": f"{NS}:{names[0]}", "items": [f"{NS}:{n}" for n in names]}, indent=2))
+
+          put("horizon-mod.toml", f'''id = "{NS}"
+          name = "Reference Pictures"
+          version = "2.0.2"
+          description = "Your pictures as full-screen overlays at 1:1 quality: wear one on your head to see it. /trigger rp_list set 1, rp_show set N, rp_off set 1."
+          authors = ["me"]
+          api = "0.2"
+          side = "both"
+          capabilities = ["registries"]
+          ''')
+          put("data/minecraft/tags/function/load.json", json.dumps({"values": [f"{NS}:load"]}, indent=2))
+          put("data/minecraft/tags/function/tick.json", json.dumps({"values": [f"{NS}:tick"]}, indent=2))
+          def fn(name, lines): put(f"data/{NS}/function/{name}.mcfunction", "\n".join(lines) + "\n")
+
+          fn("setup", ["scoreboard objectives add rp_tmp dummy", "scoreboard objectives add rp_get trigger", "scoreboard objectives add rp_show trigger",
+                       "scoreboard objectives add rp_off trigger", "scoreboard objectives add rp_list trigger",
+                       "scoreboard players set #t rp_tmp 0", "scoreboard players set #ready rp_tmp 1"])
+          fn("load", [f"function {NS}:setup"])
+          fn("tick", ["scoreboard objectives add rp_tmp dummy", f"execute unless score #ready rp_tmp matches 1 run function {NS}:setup",
+                      "scoreboard players add #t rp_tmp 1", f"execute if score #t rp_tmp matches 5.. run function {NS}:poll"])
+          fn("poll", ["scoreboard players set #t rp_tmp 0"] + [f"scoreboard players enable @a rp_{t}" for t in ("get", "show", "off", "list")] +
+              [f"execute as @a[scores={{rp_{t}=1..}}] run function {NS}:{t}" for t in ("get", "show", "off", "list")] +
+              [f"scoreboard players set @a[scores={{rp_{t}=1..}}] rp_{t} 0" for t in ("get", "show", "off", "list")])
+          bad = 'tellraw @s "No such picture. Type /trigger rp_list set 1"'
+          fn("get", [f"execute unless score @s rp_get matches 1..{len(names)} run {bad}"] + [f"execute if score @s rp_get matches {i} run function {NS}:give/{n}" for i, n in enumerate(names, 1)])
+          fn("show", [f"execute unless score @s rp_show matches 1..{len(names)} run {bad}"] + [f"execute if score @s rp_show matches {i} run function {NS}:show/{n}" for i, n in enumerate(names, 1)])
+          fn("off", [f"execute if items entity @s armor.head {NS}:{n} run function {NS}:off/{n}" for n in names])
+          fn("list", ['tellraw @s "Pictures: /trigger rp_show set NUMBER to look at one, /trigger rp_off set 1 to put it away, /trigger rp_get set NUMBER to get the item."'] +
+              [f'tellraw @s "{i}: {n}"' for i, n in enumerate(names, 1)])
+          fn("worn", [f"execute if items entity @s armor.head {NS}:{n} run scoreboard players set #ok rp_tmp 1" for n in names])
+          for n in names:   # one tiny function per picture, so a problem with one cannot touch the others
+              fn(f"give/{n}", [f"give @s {NS}:{n}", f'tellraw @s "Got picture {n}. Right-click it to wear it and see it full screen."'])
+              fn(f"show/{n}", ["scoreboard players set #ok rp_tmp 0", "execute unless items entity @s armor.head * run scoreboard players set #ok rp_tmp 1",
+                               f"function {NS}:worn",
+                               f"execute if score #ok rp_tmp matches 1 run item replace entity @s armor.head with {NS}:{n}",
+                               f'execute if score #ok rp_tmp matches 1 run tellraw @s "Showing {n}. Type /trigger rp_off set 1 to put it away."',
+                               'execute if score #ok rp_tmp matches 0 run tellraw @s "Take your helmet off first (a picture uses the head slot)."'])
+              fn(f"off/{n}", ["item replace entity @s armor.head with minecraft:air", f"give @s {NS}:{n}", 'tellraw @s "Picture put away."'])
+
+          with zipfile.ZipFile(OUT, "w", zipfile.ZIP_DEFLATED) as z:
+              for path in sorted(out): z.writestr(path, out[path])
+          print(f"built {OUT}: {len(names)} pictures, overlay size {SCREEN[0]}x{SCREEN[1]}, {os.path.getsize(OUT)//1024} KB")
+          for i, n in enumerate(names, 1): print(f"  {i}: {n}")
+          PYEOF
+      - name: Build refpics.hmod
+        run: python build_pictures.py
+      - name: Save refpics.hmod in the repo
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@users.noreply.github.com"
+          git add refpics.hmod
+          git commit -m "Build refpics.hmod" || echo "nothing new to commit"
+          git push
