@@ -1,0 +1,340 @@
+name: Build the ghost builder mod
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - schematics/**
+      - .github/workflows/ghostbuild.yml
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Write the builder
+        run: |
+          cat > build_ghost.py <<'PYEOF'
+          """Turns the schematics in ./schematics (.litematic, .schem, .schematic, .nbt) into ghostbuild.hmod:
+          a colour-coded glass 'ghost' of each build (one glass colour per block type, with a legend) that you can place,
+          rotate, view layer by layer, list materials for, and clear with /trigger commands. Also writes ghostbuild_report.txt."""
+          import glob, gzip, json, os, re, struct, zipfile
+
+          NS = "ghostbuild"
+          OUT = "ghostbuild.hmod"
+          MAX_CELLS = 2_000_000
+          MAX_FILL = 32768
+          AIR = {"air", "cave_air", "void_air", "structure_void"}
+          COLORS = ["white", "orange", "light_blue", "lime", "yellow", "magenta", "pink", "cyan", "purple", "blue", "brown", "green", "red", "light_gray", "gray", "black"]
+          HEX = {"white": "#F9FFFE", "orange": "#F9801D", "light_blue": "#3AB3DA", "lime": "#80C71F", "yellow": "#FED83D", "magenta": "#C74EBD", "pink": "#F38BAA", "cyan": "#169C9C",
+                 "purple": "#8932B8", "blue": "#3C44AA", "brown": "#835432", "green": "#5E7C16", "red": "#B02E26", "light_gray": "#9D9D97", "gray": "#474F52", "black": "#1D1D21"}
+          LEGACY = {1: "stone", 2: "grass_block", 3: "dirt", 4: "cobblestone", 5: "planks", 7: "bedrock", 8: "water", 9: "water", 10: "lava", 11: "lava", 12: "sand", 13: "gravel",
+                    14: "gold_ore", 15: "iron_ore", 16: "coal_ore", 17: "log", 18: "leaves", 20: "glass", 24: "sandstone", 35: "wool", 41: "gold_block", 42: "iron_block",
+                    43: "double_slab", 44: "slab", 45: "bricks", 47: "bookshelf", 48: "mossy_cobblestone", 49: "obsidian", 50: "torch", 53: "oak_stairs", 54: "chest",
+                    58: "crafting_table", 61: "furnace", 64: "oak_door", 65: "ladder", 67: "cobblestone_stairs", 85: "fence", 89: "glowstone", 98: "stone_bricks",
+                    102: "glass_pane", 108: "brick_stairs", 109: "stone_brick_stairs", 126: "wood_slab", 134: "spruce_stairs", 159: "terracotta", 251: "concrete"}
+
+          # ------------------------------------------------------------------ NBT
+          def read_nbt(buf):
+              pos = 0
+              def u(fmt):
+                  nonlocal pos
+                  v = struct.unpack_from(">" + fmt, buf, pos); pos += struct.calcsize(">" + fmt); return v
+              def payload(t):
+                  nonlocal pos
+                  if t == 1: return u("b")[0]
+                  if t == 2: return u("h")[0]
+                  if t == 3: return u("i")[0]
+                  if t == 4: return u("q")[0]
+                  if t == 5: return u("f")[0]
+                  if t == 6: return u("d")[0]
+                  if t == 7:
+                      n = u("i")[0]; v = bytes(buf[pos:pos + n]); pos += n; return v
+                  if t == 8:
+                      n = u("H")[0]; v = bytes(buf[pos:pos + n]).decode("utf-8", "replace"); pos += n; return v
+                  if t == 9:
+                      et = u("b")[0]; n = u("i")[0]
+                      return [payload(et) for _ in range(n)]
+                  if t == 10:
+                      d = {}
+                      while True:
+                          tt = u("b")[0]
+                          if tt == 0: return d
+                          nl = u("H")[0]; name = bytes(buf[pos:pos + nl]).decode("utf-8", "replace"); pos += nl
+                          d[name] = payload(tt)
+                  if t == 11:
+                      n = u("i")[0]; v = list(struct.unpack_from(">%di" % n, buf, pos)); pos += 4 * n; return v
+                  if t == 12:
+                      n = u("i")[0]; v = list(struct.unpack_from(">%dq" % n, buf, pos)); pos += 8 * n; return v
+                  raise ValueError("unknown NBT tag %d" % t)
+              t = u("b")[0]; nl = u("H")[0]; pos += nl
+              return payload(t)
+
+          def nice(name): return re.sub(r"\[.*", "", name).replace("minecraft:", "")
+
+          # ------------------------------------------------------------------ readers: every one returns {(x, y, z): block name}
+          def read_litematic(root):
+              cells = {}
+              for reg in root["Regions"].values():
+                  pos, size = reg["Position"], reg["Size"]
+                  sx, sy, sz = size["x"], size["y"], size["z"]
+                  ax, ay, az = abs(sx), abs(sy), abs(sz)
+                  mx = pos["x"] + (sx + 1 if sx < 0 else 0); my = pos["y"] + (sy + 1 if sy < 0 else 0); mz = pos["z"] + (sz + 1 if sz < 0 else 0)
+                  names = [nice(p["Name"]) for p in reg["BlockStatePalette"]]
+                  bits = max(2, (len(names) - 1).bit_length()); mask = (1 << bits) - 1
+                  longs = [v & 0xFFFFFFFFFFFFFFFF for v in reg["BlockStates"]]
+                  for idx in range(ax * ay * az):
+                      bp = idx * bits; li = bp >> 6; off = bp & 63
+                      val = longs[li] >> off
+                      if off + bits > 64 and li + 1 < len(longs): val |= longs[li + 1] << (64 - off)
+                      i = val & mask
+                      name = names[i] if i < len(names) else "air"
+                      if name in AIR: continue
+                      cells[(mx + idx % ax, my + idx // (ax * az), mz + (idx // ax) % az)] = name
+              return cells
+
+          def read_sponge(root):
+              sch = root.get("Schematic", root)
+              W, H, L = sch["Width"], sch["Height"], sch["Length"]
+              blocks = sch.get("Blocks", sch)
+              pal = blocks["Palette"]; data = blocks.get("Data", blocks.get("BlockData"))
+              names = {i: nice(n) for n, i in pal.items()}
+              cells = {}; i = 0; p = 0
+              while p < len(data) and i < W * H * L:
+                  val = 0; shift = 0
+                  while True:
+                      b = data[p]; p += 1; val |= (b & 0x7F) << shift
+                      if not b & 0x80: break
+                      shift += 7
+                  name = names.get(val, "air")
+                  if name not in AIR: cells[(i % W, i // (W * L), (i // W) % L)] = name
+                  i += 1
+              return cells
+
+          def read_structure(root):
+              pal = root["palettes"][0] if "palettes" in root else root["palette"]
+              names = [nice(p["Name"]) for p in pal]
+              cells = {}
+              for b in root["blocks"]:
+                  st = b["state"]
+                  name = names[st] if 0 <= st < len(names) else "air"
+                  if name not in AIR: cells[tuple(b["pos"])] = name
+              return cells
+
+          def read_legacy(root):
+              W, H, L = root["Width"], root["Height"], root["Length"]
+              blocks = root["Blocks"]; cells = {}
+              for i, b in enumerate(blocks[:W * H * L]):
+                  b &= 0xFF
+                  if b: cells[(i % W, i // (W * L), (i // W) % L)] = LEGACY.get(b, f"block_{b}")
+              return cells
+
+          def load(path):
+              raw = open(path, "rb").read()
+              try: raw = gzip.decompress(raw)
+              except OSError: pass
+              root = read_nbt(raw)
+              if "Regions" in root: return read_litematic(root)
+              if "palette" in root or "palettes" in root: return read_structure(root)
+              if "Schematic" in root or ("Palette" in root and ("BlockData" in root or "Blocks" in root)): return read_sponge(root)
+              if "Blocks" in root and "Width" in root: return read_legacy(root)
+              raise ValueError("unknown format (keys: " + ", ".join(sorted(root)[:8]) + ")")
+
+          # ------------------------------------------------------------------ boxes
+          def runs_of(vals):
+              out = []; start = prev = vals[0]
+              for v in vals[1:]:
+                  if v == prev + 1: prev = v; continue
+                  out.append((start, prev)); start = prev = v
+              out.append((start, prev)); return out
+
+          def merge(layers):
+              """layers: {k: set of keys}. Joins keys that repeat on consecutive k into (key, k1, k2)."""
+              out = []; active = {}
+              ks = sorted(layers)
+              if not ks: return out
+              for k in range(ks[0], ks[-1] + 2):
+                  cur = layers.get(k, set())
+                  for key in list(active):
+                      if key not in cur: out.append((key, active.pop(key), k - 1))
+                  for key in cur:
+                      if key not in active: active[key] = k
+              return out
+
+          def rects_of_layer(xz):
+              by_z = {}
+              for x, z in xz: by_z.setdefault(z, []).append(x)
+              rows = {z: set(runs_of(sorted(xs))) for z, xs in by_z.items()}
+              return [(x1, x2, z1, z2) for (x1, x2), z1, z2 in merge(rows)]
+
+          def split_box(b):
+              x1, y1, z1, x2, y2, z2 = b
+              dx, dy, dz = x2 - x1 + 1, y2 - y1 + 1, z2 - z1 + 1
+              if dx * dy * dz <= MAX_FILL: return [b]
+              if dy >= dx and dy >= dz:
+                  m = (y1 + y2) // 2; return split_box((x1, y1, z1, x2, m, z2)) + split_box((x1, m + 1, z1, x2, y2, z2))
+              if dx >= dz:
+                  m = (x1 + x2) // 2; return split_box((x1, y1, z1, m, y2, z2)) + split_box((m + 1, y1, z1, x2, y2, z2))
+              m = (z1 + z2) // 2; return split_box((x1, y1, z1, x2, y2, m)) + split_box((x1, y1, m + 1, x2, y2, z2))
+
+          def rel(n): return "~" if n == 0 else f"~{n}"
+          def fill_line(b, tail): return f"fill {rel(b[0])} {rel(b[1])} {rel(b[2])} {rel(b[3])} {rel(b[4])} {rel(b[5])} {tail}"
+          def glass(ci): return f"minecraft:{COLORS[ci]}_stained_glass"
+
+          def rotate(cells, size, r):
+              """cells: dict {(x,y,z): value} or a set; turns it 90 degrees r times."""
+              W, H, D = size
+              for _ in range(r):
+                  cells = ({(D - 1 - z, y, x): v for (x, y, z), v in cells.items()} if isinstance(cells, dict) else {(D - 1 - z, y, x) for (x, y, z) in cells})
+                  W, D = D, W
+              return cells, (W, H, D)
+
+          # ------------------------------------------------------------------ build
+          out = {}
+          report = []
+          def put(path, text): out[path] = text.encode()
+          def fn(name, lines): put(f"data/{NS}/function/{name}.mcfunction", "\n".join(lines) + "\n")
+          def tell(color, text): return 'tellraw @s ' + json.dumps([{"text": "\u25a0 ", "color": color}, {"text": text}])
+
+          files = sorted(f for f in glob.glob("schematics/*") if f.lower().endswith((".litematic", ".schem", ".schematic", ".nbt")))[:30]
+          if not files:
+              raise SystemExit("No schematics found: put .litematic, .schem, .schematic or .nbt files in the schematics folder.")
+          builds = []
+          for f in files:
+              name = re.sub(r"[^a-z0-9_]+", "_", os.path.splitext(os.path.basename(f))[0].lower()).strip("_")[:30] or "build"
+              try:
+                  cells = load(f)
+              except Exception as e:
+                  report.append(f"SKIPPED {os.path.basename(f)}: {e}"); continue
+              if not cells: report.append(f"SKIPPED {os.path.basename(f)}: no blocks in it"); continue
+              if len(cells) > MAX_CELLS: report.append(f"SKIPPED {os.path.basename(f)}: {len(cells)} blocks is too many"); continue
+              counts = {}
+              for n in cells.values(): counts[n] = counts.get(n, 0) + 1
+              order = sorted(counts, key=lambda n: (-counts[n], n))
+              col = {n: i for i, n in enumerate(order[:16] if len(order) <= 16 else order[:15])}
+              others = [] if len(order) <= 16 else order[15:]
+              for n in others: col[n] = 15
+              mn = [min(c[i] for c in cells) for i in range(3)]
+              pts = {(x - mn[0], y - mn[1], z - mn[2]): col[n] for (x, y, z), n in cells.items()}
+              names_at = {(x - mn[0], y - mn[1], z - mn[2]): n for (x, y, z), n in cells.items()}
+              size = tuple(max(p[i] for p in pts) + 1 for i in range(3))
+              s = len(builds) + 1
+              while any(b[0] == name for b in builds): name += "_"
+              builds.append((name, size, len(pts)))
+              report.append(f"OK {os.path.basename(f)} -> build {s} '{name}': {size[0]}x{size[1]}x{size[2]}, {len(pts)} blocks, {len(order)} block types")
+              used = sorted(set(pts.values()))
+              for r in range(4):
+                  rp, (W, H, D) = rotate(pts, size, r)
+                  by_col_layer = {}
+                  for (x, y, z), ci in rp.items(): by_col_layer.setdefault(ci, {}).setdefault(y, set()).add((x, z))
+                  rects = {ci: {y: set(rects_of_layer(xz)) for y, xz in ly.items()} for ci, ly in by_col_layer.items()}
+                  layer_lines = {}
+                  for ci in sorted(rects):
+                      for y, rs in sorted(rects[ci].items()):
+                          for rc in sorted(rs):
+                              layer_lines.setdefault(y, []).extend(fill_line(b, f"{glass(ci)} keep") for b in split_box((rc[0], y, rc[2], rc[1], y, rc[3])))
+                  for y, lines in sorted(layer_lines.items()): fn(f"s{s}/r{r}/layer{y + 1}", lines)
+                  alls = []
+                  for ci in sorted(rects):
+                      for (rc, y1, y2) in sorted(merge({y: set(rs) for y, rs in rects[ci].items()})):
+                          alls.extend(fill_line(b, f"{glass(ci)} keep") for b in split_box((rc[0], y1, rc[2], rc[1], y2, rc[3])))
+                  fn(f"s{s}/r{r}/all", alls)
+                  fn(f"s{s}/r{r}/clear", [fill_line(b, f"minecraft:air replace {glass(ci)}") for ci in used for b in split_box((0, 0, 0, W - 1, H - 1, D - 1))])
+              fn(f"s{s}/place_all", [f"execute if score #rot gb_tmp matches {r} at @e[type=minecraft:item,tag=gb_anchor,limit=1] run function {NS}:s{s}/r{r}/all" for r in range(4)])
+              fn(f"s{s}/wipe", [f"execute if score #rot gb_tmp matches {r} at @e[type=minecraft:item,tag=gb_anchor,limit=1] run function {NS}:s{s}/r{r}/clear" for r in range(4)])
+              fn(f"s{s}/place_layer", [f"execute if score #rot gb_tmp matches {r} if score #layer gb_tmp matches {k} at @e[type=minecraft:item,tag=gb_anchor,limit=1] run function {NS}:s{s}/r{r}/layer{k}"
+                                       for r in range(4) for k in range(1, size[1] + 1)])
+              # legend: which glass colour is which block (whole build, and per layer)
+              def legend(cellkeys):
+                  by = {}
+                  for p in cellkeys:
+                      ci = pts[p]; by.setdefault(ci, {}); by[ci][names_at[p]] = by[ci].get(names_at[p], 0) + 1
+                  lines = []
+                  for ci in sorted(by):
+                      nm = sorted(by[ci].items(), key=lambda kv: -kv[1]); total = sum(c for _, c in nm)
+                      label = f"{nm[0][0]} x{total}" if len(nm) == 1 else "other: " + ", ".join(n for n, _ in nm[:6]) + (" ..." if len(nm) > 6 else "") + f" x{total}"
+                      lines.append(tell(HEX[COLORS[ci]], f"{COLORS[ci].replace('_', ' ')} glass = {label}"))
+                  return lines
+              fn(f"legend/s{s}/all", ['tellraw @s "Legend (glass colour = block to place):"'] + legend(pts.keys()))
+              for y in range(size[1]):
+                  fn(f"legend/s{s}/l{y + 1}", [f'tellraw @s "Layer {y + 1} legend:"'] + legend([p for p in pts if p[1] == y]))
+              fn(f"s{s}/legend", [f"execute if score #layer gb_tmp matches 0 run function {NS}:legend/s{s}/all"] + [f"execute if score #layer gb_tmp matches {k} run function {NS}:legend/s{s}/l{k}" for k in range(1, size[1] + 1)])
+              mats = sorted(counts.items(), key=lambda kv: -kv[1])[:30]
+              fn(f"mat/{s}", [f'tellraw @s "Materials for {name}: {len(pts)} blocks"'] + [f'tellraw @s "{n}: {c} ({c // 64} stacks + {c % 64})"' for n, c in mats])
+              fn(f"show/{s}", [f"function {NS}:clear", f"scoreboard players set #cur gb_tmp {s}", f"scoreboard players set #h gb_tmp {size[1]}",
+                  "execute unless score @s gb_r matches 0..3 run scoreboard players set @s gb_r 0", "scoreboard players operation #rot gb_tmp = @s gb_r",
+                  "scoreboard players set #layer gb_tmp 0",
+                  'execute at @s align xyz run summon minecraft:item ~1.5 ~ ~1.5 {Item:{id:"minecraft:stick",count:1},Tags:["gb_anchor"],NoGravity:1b,PickupDelay:32767s,Age:-32768s}',
+                  'execute unless entity @e[type=minecraft:item,tag=gb_anchor] run tellraw @s "Could not place the origin marker."',
+                  f"function {NS}:place",
+                  f'tellraw @s "Ghost of {name} ({size[0]}x{size[1]}x{size[2]}) placed: its corner is one block south-east of you and it grows south and east."',
+                  f"function {NS}:legend"])
+
+          open("ghostbuild_report.txt", "w").write("\n".join(report) + "\n")
+          print("\n".join(report))
+          if not builds: raise SystemExit("Nothing could be read: see ghostbuild_report.txt")
+          N = len(builds)
+          put("horizon-mod.toml", f'''id = "{NS}"
+          name = "Ghost Builder"
+          version = "2.0.0"
+          description = "A colour-coded glass ghost of your .litematic / .schem / .nbt builds with a legend (glass colour = block). Place, rotate, layer by layer, materials, clear. /trigger gb_list set 1."
+          authors = ["me"]
+          api = "0.2"
+          side = "both"
+          capabilities = ["registries"]
+          ''')
+          put("data/minecraft/tags/function/load.json", json.dumps({"values": [f"{NS}:load"]}, indent=2))
+          put("data/minecraft/tags/function/tick.json", json.dumps({"values": [f"{NS}:tick"]}, indent=2))
+          TR = ["list", "show", "rot", "layer", "next", "prev", "all", "clear", "mat", "legend"]
+          fn("setup", ["scoreboard objectives add gb_tmp dummy", "scoreboard objectives add gb_r dummy"] + [f"scoreboard objectives add gb_{t} trigger" for t in TR] +
+             ["scoreboard players set #t gb_tmp 0", "scoreboard players set #ready gb_tmp 1"])
+          fn("load", [f"function {NS}:setup"])
+          fn("tick", ["scoreboard objectives add gb_tmp dummy", f"execute unless score #ready gb_tmp matches 1 run function {NS}:setup",
+                      "scoreboard players add #t gb_tmp 1", f"execute if score #t gb_tmp matches 5.. run function {NS}:poll"])
+          fn("poll", ["scoreboard players set #t gb_tmp 0"] + [f"scoreboard players enable @a gb_{t}" for t in TR] +
+             [f"execute as @a[scores={{gb_{t}=1..}}] run function {NS}:{t}" for t in TR] + [f"scoreboard players set @a[scores={{gb_{t}=1..}}] gb_{t} 0" for t in TR])
+          bad = 'tellraw @s "No such build. Type /trigger gb_list set 1"'
+          fn("list", ['tellraw @s "Builds: /trigger gb_show set N (place), gb_rot set 1..4, gb_layer set N, gb_next set 1, gb_prev set 1, gb_all set 1, gb_legend set 1, gb_mat set N, gb_clear set 1"'] +
+             [f'tellraw @s "{i}: {b[0]} ({b[1][0]}x{b[1][1]}x{b[1][2]}, {b[2]} blocks)"' for i, b in enumerate(builds, 1)])
+          fn("show", [f"execute unless score @s gb_show matches 1..{N} run {bad}"] + [f"execute if score @s gb_show matches {i} run function {NS}:show/{i}" for i in range(1, N + 1)])
+          fn("mat", [f"execute unless score @s gb_mat matches 1..{N} run {bad}"] + [f"execute if score @s gb_mat matches {i} run function {NS}:mat/{i}" for i in range(1, N + 1)])
+          fn("rot", ['execute unless score @s gb_rot matches 1..4 run tellraw @s "Rotation: /trigger gb_rot set 1 (0 deg), 2 (90), 3 (180), 4 (270), then gb_show again"',
+                     "execute if score @s gb_rot matches 1..4 run scoreboard players operation @s gb_r = @s gb_rot", "execute if score @s gb_rot matches 1..4 run scoreboard players remove @s gb_r 1",
+                     'execute if score @s gb_rot matches 1..4 run tellraw @s "Rotation set. Use /trigger gb_show set N to place the ghost again."'])
+          fn("wipe", [f"execute if score #cur gb_tmp matches {i} run function {NS}:s{i}/wipe" for i in range(1, N + 1)])
+          fn("place", [f"execute if score #layer gb_tmp matches 0 run function {NS}:place_all", f"execute if score #layer gb_tmp matches 1.. run function {NS}:place_layer"])
+          fn("place_all", [f"execute if score #cur gb_tmp matches {i} run function {NS}:s{i}/place_all" for i in range(1, N + 1)])
+          fn("place_layer", [f"execute if score #cur gb_tmp matches {i} run function {NS}:s{i}/place_layer" for i in range(1, N + 1)])
+          fn("legend", [f"execute if score #cur gb_tmp matches {i} run function {NS}:s{i}/legend" for i in range(1, N + 1)] + ["execute unless score #cur gb_tmp matches 1.. run tellraw @s \"Place a ghost first: /trigger gb_show set N\""])
+          nocur = 'execute unless score #cur gb_tmp matches 1.. run tellraw @s "Place a ghost first: /trigger gb_show set N"'
+          layer_msg = 'tellraw @s [{"text":"Layer "},{"score":{"name":"#layer","objective":"gb_tmp"}},{"text":" of "},{"score":{"name":"#h","objective":"gb_tmp"}}]'
+          fn("layer", [nocur, "execute if score #cur gb_tmp matches 1.. unless score @s gb_layer <= #h gb_tmp run tellraw @s \"That layer is above the build.\"",
+                       f"execute if score #cur gb_tmp matches 1.. if score @s gb_layer <= #h gb_tmp run function {NS}:layer_go"])
+          fn("layer_go", [f"function {NS}:wipe", "scoreboard players operation #layer gb_tmp = @s gb_layer", f"function {NS}:place", layer_msg, f"function {NS}:legend"])
+          fn("next", [nocur, f"execute if score #cur gb_tmp matches 1.. run function {NS}:next_go"])
+          fn("next_go", [f"function {NS}:wipe", "scoreboard players add #layer gb_tmp 1", "execute if score #layer gb_tmp > #h gb_tmp run scoreboard players operation #layer gb_tmp = #h gb_tmp",
+                         f"function {NS}:place", layer_msg, f"function {NS}:legend"])
+          fn("prev", [nocur, f"execute if score #cur gb_tmp matches 1.. run function {NS}:prev_go"])
+          fn("prev_go", [f"function {NS}:wipe", "execute if score #layer gb_tmp matches 2.. run scoreboard players remove #layer gb_tmp 1", "execute if score #layer gb_tmp matches 0 run scoreboard players set #layer gb_tmp 1",
+                         f"function {NS}:place", layer_msg, f"function {NS}:legend"])
+          fn("all", [nocur, f"execute if score #cur gb_tmp matches 1.. run function {NS}:all_go"])
+          fn("all_go", [f"function {NS}:wipe", "scoreboard players set #layer gb_tmp 0", f"function {NS}:place", 'tellraw @s "Whole ghost shown."', f"function {NS}:legend"])
+          fn("clear", [f"function {NS}:wipe", "kill @e[type=minecraft:item,tag=gb_anchor]", "scoreboard players set #cur gb_tmp 0", 'tellraw @s "Ghost removed."'])
+          with zipfile.ZipFile(OUT, "w", zipfile.ZIP_DEFLATED) as z:
+              for path in sorted(out): z.writestr(path, out[path])
+          print(f"built {OUT}: {N} builds, {len(out)} files, {os.path.getsize(OUT)//1024} KB")
+          PYEOF
+      - name: Build ghostbuild.hmod
+        continue-on-error: true
+        run: python build_ghost.py
+      - name: Save the mod and the report in the repo
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@users.noreply.github.com"
+          [ -f ghostbuild_report.txt ] && git add ghostbuild_report.txt
+          [ -f ghostbuild.hmod ] && git add ghostbuild.hmod
+          git commit -m "Build ghostbuild.hmod" || echo "nothing new to commit"
+          git push
